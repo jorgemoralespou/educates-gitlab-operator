@@ -1,0 +1,7 @@
+apiVersion: training.educates.dev/v1beta1
+kind: TrainingPortal
+metadata:
+  name: lab-gitlab-operator
+spec:
+  workshops:
+    - name: lab-gitlab-operator

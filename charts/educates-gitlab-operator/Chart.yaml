@@ -1,0 +1,6 @@
+apiVersion: v2
+name: educates-gitlab-operator
+description: Helm chart for the Educates GitLab workshop operator
+type: application
+version: 0.1.0
+appVersion: "1.0.0"

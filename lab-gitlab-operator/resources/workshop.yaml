@@ -1,0 +1,85 @@
+apiVersion: training.educates.dev/v1beta1
+kind: Workshop
+metadata:
+  name: lab-gitlab-operator
+spec:
+  title: GitLab Operator Showcase
+  description: Deploy a GitLab server and user through Kubernetes custom resources managed by the GitLab Workshop Operator.
+  vendor: Educates
+  difficulty: intermediate
+  duration: 15m
+  publish:
+    image: "$(image_repository)/lab-gitlab-operator-files:$(workshop_version)"
+    files:
+    - directory:
+        path: .
+      includePaths:
+      - /workshop/**
+      - /exercises/**
+      - /README.md
+  workshop:
+    files:
+    - image:
+        url: "$(image_repository)/lab-gitlab-operator-files:$(workshop_version)"
+  session:
+    namespaces:
+      budget: custom
+      security:
+        token:
+          enabled: true
+    applications:
+      terminal:
+        enabled: true
+        layout: split
+      editor:
+        enabled: true
+      console:
+        enabled: true
+    objects:
+    - apiVersion: rbac.authorization.k8s.io/v1
+      kind: Role
+      metadata:
+        name: gitlab-operator-session
+      rules:
+      - apiGroups:
+        - gitlab.operators.educates.dev
+        resources:
+        - gitlabinstances
+        - gitlabusers
+        verbs:
+        - get
+        - list
+        - watch
+        - create
+        - update
+        - patch
+        - delete
+      - apiGroups:
+        - gitlab.operators.educates.dev
+        resources:
+        - gitlabinstances/status
+        - gitlabusers/status
+        verbs:
+        - get
+        - update
+        - patch
+      - apiGroups:
+        - ""
+        resources:
+        - secrets
+        verbs:
+        - get
+        - list
+        - watch
+    - apiVersion: rbac.authorization.k8s.io/v1
+      kind: RoleBinding
+      metadata:
+        name: gitlab-operator-session
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: Role
+        name: gitlab-operator-session
+      subjects:
+      - kind: ServiceAccount
+        namespace: $(workshop_namespace)
+        name: $(service_account)

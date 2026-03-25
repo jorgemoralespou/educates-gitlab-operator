@@ -1,0 +1,116 @@
+name: Build and Publish
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+      - "[0-9]+.[0-9]+.[0-9]+-alpha.[0-9]+"
+      - "[0-9]+.[0-9]+.[0-9]+-beta.[0-9]+"
+      - "[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+"
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  CHART_NAME: educates-gitlab-operator
+  CHART_PATH: charts/educates-gitlab-operator
+
+jobs:
+  build-image:
+    name: Build and push container image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v7
+        with:
+          context: ./operator
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  publish-chart:
+    name: Package and push Helm chart
+    runs-on: ubuntu-latest
+    needs: build-image
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v5
+
+      - name: Determine chart version and image tag
+        id: chart_version
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME}"
+          else
+            VERSION="0.0.0-main.${GITHUB_RUN_NUMBER}"
+          fi
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+
+          IMAGE_REPO_LC="$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')"
+          echo "image_repository=${IMAGE_REPO_LC}" >> "${GITHUB_OUTPUT}"
+
+      - name: Set chart image defaults
+        run: |
+          VALUES_FILE="${{ env.CHART_PATH }}/values.yaml"
+          sed -i "s|repository:.*|repository: ${{ steps.chart_version.outputs.image_repository }}|" "${VALUES_FILE}"
+          sed -i "s|tag:.*|tag: \"${{ steps.chart_version.outputs.version }}\"|" "${VALUES_FILE}"
+          sed -i "s|pullPolicy:.*|pullPolicy: IfNotPresent|" "${VALUES_FILE}"
+
+      - name: Log in Helm to GHCR
+        run: |
+          helm registry login "${{ env.REGISTRY }}" \
+            --username "${{ github.actor }}" \
+            --password "${{ secrets.GITHUB_TOKEN }}"
+
+      - name: Package Helm chart
+        run: |
+          mkdir -p .chart-dist
+          helm package "${{ env.CHART_PATH }}" \
+            --version "${{ steps.chart_version.outputs.version }}" \
+            --app-version "${{ steps.chart_version.outputs.version }}" \
+            --destination .chart-dist
+
+      - name: Push Helm chart to GHCR (OCI)
+        run: |
+          OWNER_LC="$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
+          helm push ".chart-dist/${{ env.CHART_NAME }}-${{ steps.chart_version.outputs.version }}.tgz" \
+            "oci://${{ env.REGISTRY }}/${OWNER_LC}/charts"

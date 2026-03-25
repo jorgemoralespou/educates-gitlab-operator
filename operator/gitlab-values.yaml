@@ -1,0 +1,117 @@
+global:
+  hosts:
+    domain: educates.test
+  ingress:
+    configureCertmanager: false
+    class: contour
+    annotations:
+      kubernetes.io/ingress.class: contour
+#    tls:
+#      secretName: educates.test-tls
+#  certificates:
+#    customCAs:
+#      - secret: educates.test-ca
+  appConfig:
+    initialDefaults:
+      signupEnabled: false
+  minio:
+    enabled: true
+  registry:
+    enabled: true
+  kas:
+    enabled: false
+
+# You already have an ingress controller and wildcard cert.
+installCertmanager: false
+nginx-ingress:
+  enabled: false
+
+# Keep GitLab lean.
+prometheus:
+  install: false
+gitlab-runner:
+  install: false
+gitlab-zoekt:
+  install: false
+
+# Optional components not needed for Git + Registry basics.
+# Single-replica / fixed HPA bounds for workshop-sized clusters (webservice, sidekiq,
+# shell, and registry still create HPAs, but min==max prevents scaling).
+#
+# Resources: Educates session namespaces use LimitRanges — chart defaults (e.g. webservice
+# 2.5Gi request) exceed typical default limits (often 512Mi), which breaks admission with:
+#   requests must be <= memory limit
+# Tune session.namespaces.budget / limits in the Workshop if GitLab OOMs.
+gitlab:
+  webservice:
+    minReplicas: 1
+    maxReplicas: 1
+    resources:
+      requests:
+        cpu: 200m
+        memory: 384Mi
+      limits:
+        cpu: "1"
+        memory: 2Gi
+    workhorse:
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          cpu: 500m
+          memory: 1Gi
+  sidekiq:
+    minReplicas: 1
+    maxReplicas: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: "1"
+        memory: 1.5Gi
+  gitlab-shell:
+    minReplicas: 1
+    maxReplicas: 1
+    resources:
+      requests:
+        cpu: 50m
+        memory: 32Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+  kas:
+    enabled: false
+  gitlab-exporter:
+    enabled: false
+  gitaly:
+    persistence:
+      enabled: false
+
+# Keep defaults needed for a self-contained install.
+postgresql:
+  install: true
+  primary:
+    persistence:
+      enabled: false
+redis:
+  install: true
+  master:
+    persistence:
+      enabled: false
+  replica:
+    persistence:
+      enabled: false
+
+minio:
+  replicas: 1
+  persistence:
+    enabled: false
+
+registry:
+  hpa:
+    minReplicas: 1
+    maxReplicas: 1
+  persistence:
+    enabled: false

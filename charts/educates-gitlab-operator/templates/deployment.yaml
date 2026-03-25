@@ -1,0 +1,73 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "educates-gitlab-operator.fullname" . }}
+  namespace: {{ include "educates-gitlab-operator.namespace" . }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ include "educates-gitlab-operator.fullname" . }}
+  template:
+    metadata:
+      labels:
+        app: {{ include "educates-gitlab-operator.fullname" . }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      containers:
+        - name: operator
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- if or .Values.gitlab.tlsSecretName .Values.gitlab.caSecretName .Values.gitlab.insecureSkipTlsVerify .Values.extraEnv }}
+          env:
+            {{- if .Values.gitlab.tlsSecretName }}
+            - name: GITLAB_TLS_SECRET_NAME
+              value: {{ .Values.gitlab.tlsSecretName | quote }}
+            {{- end }}
+            {{- if .Values.gitlab.caSecretName }}
+            - name: GITLAB_CA_SECRET_NAME
+              value: {{ .Values.gitlab.caSecretName | quote }}
+            {{- end }}
+            {{- if .Values.gitlab.caSecretKey }}
+            - name: GITLAB_CA_SECRET_KEY
+              value: {{ .Values.gitlab.caSecretKey | quote }}
+            {{- end }}
+            {{- if .Values.gitlab.insecureSkipTlsVerify }}
+            - name: GITLAB_INSECURE_SKIP_TLS_VERIFY
+              value: "true"
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- end }}
+          ports:
+            - name: probes
+              containerPort: 8080
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: probes
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: probes
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}

@@ -1,0 +1,137 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: gitlabinstances.gitlab.operators.educates.dev
+spec:
+  group: gitlab.operators.educates.dev
+  scope: Namespaced
+  names:
+    plural: gitlabinstances
+    singular: gitlabinstance
+    kind: GitLabInstance
+    shortNames: [gli]
+  versions:
+    - name: v1beta1
+      served: true
+      storage: true
+      additionalPrinterColumns:
+        - name: Ready
+          type: string
+          jsonPath: .status.ready
+        - name: URL
+          type: string
+          jsonPath: .status.gitlabUrl
+        - name: Status
+          type: string
+          jsonPath: .status.message
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [domain]
+              properties:
+                domain:
+                  type: string
+                gitlabUrl:
+                  type: string
+                insecureSkipTlsVerify:
+                  type: boolean
+                tlsSecretRef:
+                  type: object
+                  properties:
+                    name:
+                      type: string
+                caSecretRef:
+                  type: object
+                  properties:
+                    name:
+                      type: string
+                    key:
+                      type: string
+                chartVersion:
+                  type: string
+                valuesYaml:
+                  type: string
+                values:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+      subresources:
+        status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: gitlabusers.gitlab.operators.educates.dev
+spec:
+  group: gitlab.operators.educates.dev
+  scope: Namespaced
+  names:
+    plural: gitlabusers
+    singular: gitlabuser
+    kind: GitLabUser
+    shortNames: [glu]
+  versions:
+    - name: v1beta1
+      served: true
+      storage: true
+      additionalPrinterColumns:
+        - name: Password
+          type: string
+          jsonPath: .spec.password
+        - name: GitLabInstance
+          type: string
+          jsonPath: .spec.instanceRef
+        - name: Ready
+          type: string
+          jsonPath: .status.ready
+        - name: Status
+          type: string
+          jsonPath: .status.message
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [instanceRef, password]
+              properties:
+                instanceRef:
+                  type: string
+                password:
+                  type: string
+                email:
+                  type: string
+                name:
+                  type: string
+                admin:
+                  type: boolean
+                tokenSecretRef:
+                  type: object
+                  properties:
+                    name:
+                      type: string
+                    key:
+                      type: string
+                repositories:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      projectName:
+                        type: string
+                      projectPath:
+                        type: string
+                      importUrl:
+                        type: string
+                      visibility:
+                        type: string
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+      subresources:
+        status: {}

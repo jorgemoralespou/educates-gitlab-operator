@@ -1,0 +1,8 @@
+image:
+  repository: localhost:5001/educates-gitlab-operator
+  pullPolicy: Always
+
+
+gitlab:
+  tlsSecretName: my-tls
+  caSecretName: my-ca
