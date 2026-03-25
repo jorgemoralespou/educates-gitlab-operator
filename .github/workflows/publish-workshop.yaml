@@ -21,7 +21,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v6
       - name: Create release
-        uses: educates/educates-github-actions/publish-workshop@v7
+        uses: educates/educates-github-actions/publish-workshop@main
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           path: ./lab-gitlab-operator
