@@ -61,8 +61,8 @@ After CI publishes the chart:
 
 ```bash
 helm install educates-gitlab-operator \
-  oci://ghcr.io/<owner>/charts/educates-gitlab-operator \
-  --version <chart-version> \
+  oci://ghcr.io/jorgemoralespou/charts/educates-gitlab-operator \
+  --version main \
   --namespace gitlab-operator-system \
   --create-namespace
 ```
