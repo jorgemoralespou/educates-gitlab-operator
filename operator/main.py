@@ -22,6 +22,8 @@ import requests
 import yaml
 from kubernetes.stream import stream
 
+logger = logging.getLogger(__name__)
+
 GROUP = "gitlab.operators.educates.dev"
 VERSION = "v1beta1"
 DEFAULT_VALUES_PATH_ENV = "GITLAB_DEFAULT_VALUES_PATH"
@@ -37,29 +39,41 @@ DEFAULT_BOOTSTRAP_PAT_KEY = "token"
 DEFAULT_BOOTSTRAP_PAT_NAME = "workshop-bootstrap"
 DEFAULT_BOOTSTRAP_PAT_EXPIRES_DAYS = 30
 
-# Operator-level TLS/CA defaults (environment variables).
-# Instance CR fields override these when set.
-OPERATOR_TLS_SECRET_NAME_ENV = "GITLAB_TLS_SECRET_NAME"
-OPERATOR_CA_SECRET_NAME_ENV = "GITLAB_CA_SECRET_NAME"
-OPERATOR_CA_SECRET_KEY_ENV = "GITLAB_CA_SECRET_KEY"
+# Operator-level cert-manager configuration (environment variables).
+# Instance CR spec.certManagerIssuerRef overrides these when set.
+OPERATOR_CERT_MANAGER_ISSUER_NAME_ENV = "GITLAB_CERT_MANAGER_ISSUER_NAME"
 OPERATOR_INSECURE_SKIP_TLS_VERIFY_ENV = "GITLAB_INSECURE_SKIP_TLS_VERIFY"
-OPERATOR_CA_SECRET_KEY_DEFAULT = "ca.crt"
+DEFAULT_CERT_MANAGER_ISSUER_NAME = "educateswildcard"
 
 
-def _operator_tls_secret_name() -> Optional[str]:
-    return os.getenv(OPERATOR_TLS_SECRET_NAME_ENV) or None
-
-
-def _operator_ca_ref() -> Optional[Dict[str, str]]:
-    name = os.getenv(OPERATOR_CA_SECRET_NAME_ENV)
-    if not name:
-        return None
-    key = os.getenv(OPERATOR_CA_SECRET_KEY_ENV, OPERATOR_CA_SECRET_KEY_DEFAULT)
-    return {"name": name, "key": key}
+def _operator_cert_manager_issuer_name() -> str:
+    return os.getenv(OPERATOR_CERT_MANAGER_ISSUER_NAME_ENV, DEFAULT_CERT_MANAGER_ISSUER_NAME)
 
 
 def _operator_insecure_skip_tls() -> bool:
-    return os.getenv(OPERATOR_INSECURE_SKIP_TLS_VERIFY_ENV, "").lower() in ("true", "1", "yes")
+    return os.getenv(OPERATOR_INSECURE_SKIP_TLS_VERIFY_ENV, "").lower() in (
+        "true",
+        "1",
+        "yes",
+    )
+
+
+def _instance_tls_secret_name(instance_name: str) -> str:
+    return f"{instance_name}-tls"
+
+
+def _resolve_cert_manager_issuer(spec: Dict[str, Any]) -> Dict[str, str]:
+    """Resolve cert-manager issuer: instance CR > operator env > default."""
+    instance_ref = spec.get("certManagerIssuerRef")
+    if isinstance(instance_ref, dict) and instance_ref.get("name"):
+        return {
+            "name": instance_ref["name"],
+            "kind": instance_ref.get("kind", "ClusterIssuer"),
+        }
+    return {
+        "name": _operator_cert_manager_issuer_name(),
+        "kind": "ClusterIssuer",
+    }
 
 
 # ---- Shell/command helpers -------------------------------------------------
@@ -97,9 +111,16 @@ def _instance_gitlab_url(body: Dict[str, Any]) -> str:
         return explicit.rstrip("/")
     domain = body.get("spec", {}).get("domain")
     if not domain:
-        raise kopf.TemporaryError("GitLabInstance requires spec.domain or spec.gitlabUrl", delay=10)
+        raise kopf.TemporaryError(
+            "GitLabInstance requires spec.domain or spec.gitlabUrl", delay=10
+        )
     instance_name = body.get("metadata", {}).get("name", "gitlab")
     return f"https://gitlab-{instance_name}.{domain}"
+
+
+def _instance_internal_url(instance: Dict[str, Any], namespace: str) -> str:
+    instance_name = instance.get("metadata", {}).get("name", "gitlab")
+    return f"http://{instance_name}-webservice-default.{namespace}:8080"
 
 
 def _instance_bootstrap_pat_secret_name(instance_name: str) -> str:
@@ -114,35 +135,24 @@ def _instance_tls_verify(body: Dict[str, Any]) -> bool:
     return not _operator_insecure_skip_tls()
 
 
-def _secret_ref(spec: Dict[str, Any], field: str) -> Optional[Dict[str, Any]]:
-    ref = spec.get(field)
-    if not isinstance(ref, dict):
-        return None
-    if not ref.get("name"):
-        return None
-    return ref
-
-
-def _resolve_ca_ref(spec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Resolve CA ref: instance CR field > operator env var > None."""
-    instance_ref = _secret_ref(spec, "caSecretRef")
-    if instance_ref:
-        return instance_ref
-    return _operator_ca_ref()
-
-
-def _instance_verify_arg(instance: Dict[str, Any], namespace: str) -> Tuple[bool | str, Optional[str]]:
-    spec = instance.get("spec", {})
+def _instance_verify_arg(
+    instance: Dict[str, Any], namespace: str
+) -> Tuple[bool | str, Optional[str]]:
     if not _instance_tls_verify(instance):
         return False, None
 
-    ca_ref = _resolve_ca_ref(spec)
-    if not ca_ref:
+    instance_name = instance["metadata"]["name"]
+    tls_secret_name = _instance_tls_secret_name(instance_name)
+    v1 = kubernetes.client.CoreV1Api()
+    try:
+        secret = v1.read_namespaced_secret(tls_secret_name, namespace)
+    except kubernetes.client.exceptions.ApiException:
         return True, None
 
-    ca_secret_name = ca_ref["name"]
-    key = ca_ref.get("key", OPERATOR_CA_SECRET_KEY_DEFAULT)
-    ca_pem = _secret_value(namespace, ca_secret_name, key)
+    if not secret.data or "ca.crt" not in secret.data:
+        return True, None
+
+    ca_pem = base64.b64decode(secret.data["ca.crt"]).decode("utf-8")
     fd, ca_path = tempfile.mkstemp(prefix="gitlab-ca-", suffix=".crt")
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(ca_pem)
@@ -176,7 +186,9 @@ def _load_default_values() -> Dict[str, Any]:
             with open(candidate, "r", encoding="utf-8") as f:
                 data = yaml.safe_load(f) or {}
             if not isinstance(data, dict):
-                raise kopf.PermanentError(f"Default values file must be a YAML map: {candidate}")
+                raise kopf.PermanentError(
+                    f"Default values file must be a YAML map: {candidate}"
+                )
             return data
     raise kopf.PermanentError(
         f"Default values file not found. Set {DEFAULT_VALUES_PATH_ENV} or provide one of: {DEFAULT_VALUES_CANDIDATES}"
@@ -189,7 +201,9 @@ def _load_instance_values(spec: Dict[str, Any]) -> Dict[str, Any]:
     if "valuesYaml" in spec:
         loaded = yaml.safe_load(spec["valuesYaml"]) or {}
         if not isinstance(loaded, dict):
-            raise kopf.PermanentError("spec.valuesYaml must parse to a YAML map/object.")
+            raise kopf.PermanentError(
+                "spec.valuesYaml must parse to a YAML map/object."
+            )
         return loaded
     values = spec.get("values", {})
     if values is None:
@@ -202,11 +216,7 @@ def _load_instance_values(spec: Dict[str, Any]) -> Dict[str, Any]:
 def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
     result: Dict[str, Any] = copy.deepcopy(base)
     for key, value in override.items():
-        if (
-            key in result
-            and isinstance(result[key], dict)
-            and isinstance(value, dict)
-        ):
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
             result[key] = _deep_merge(result[key], value)
         else:
             result[key] = value
@@ -220,20 +230,13 @@ def _ensure_map(parent: Dict[str, Any], key: str) -> Dict[str, Any]:
     return parent[key]
 
 
-def _resolve_tls_secret_name(spec: Dict[str, Any]) -> Optional[str]:
-    """Resolve TLS secret name: instance CR field > operator env var > None."""
-    tls_ref = _secret_ref(spec, "tlsSecretRef")
-    if tls_ref:
-        return tls_ref["name"]
-    return _operator_tls_secret_name()
-
-
-def _apply_explicit_overlays(values: Dict[str, Any], spec: Dict[str, Any], instance_name: str) -> Dict[str, Any]:
+def _apply_explicit_overlays(
+    values: Dict[str, Any], spec: Dict[str, Any], instance_name: str
+) -> Dict[str, Any]:
     merged = copy.deepcopy(values)
 
     domain = (spec.get("domain") or "").strip()
-    tls_secret_name = _resolve_tls_secret_name(spec)
-    ca_ref = _resolve_ca_ref(spec)
+    tls_secret_name = _instance_tls_secret_name(instance_name)
 
     global_cfg = _ensure_map(merged, "global")
     hosts_cfg = _ensure_map(global_cfg, "hosts")
@@ -244,7 +247,9 @@ def _apply_explicit_overlays(values: Dict[str, Any], spec: Dict[str, Any], insta
 
     # Domain is required by CRD; always force it as final overlay.
     if not domain:
-        raise kopf.PermanentError("GitLabInstance spec.domain is required and must be non-empty.")
+        raise kopf.PermanentError(
+            "GitLabInstance spec.domain is required and must be non-empty."
+        )
     hosts_cfg["domain"] = domain
 
     # Use the chart-native hostSuffix to enforce:
@@ -257,18 +262,145 @@ def _apply_explicit_overlays(values: Dict[str, Any], spec: Dict[str, Any], insta
     registry_host_cfg.pop("name", None)
     minio_host_cfg.pop("name", None)
 
-    if tls_secret_name:
-        tls_cfg = _ensure_map(ingress_cfg, "tls")
-        tls_cfg["secretName"] = tls_secret_name
+    # TLS: use the cert-manager-issued secret (created by the operator before helm install).
+    tls_cfg = _ensure_map(ingress_cfg, "tls")
+    tls_cfg["secretName"] = tls_secret_name
 
-    if ca_ref:
-        certs_cfg = _ensure_map(global_cfg, "certificates")
-        certs_cfg["customCAs"] = [{"secret": ca_ref["name"]}]
+    # CA trust for all GitLab pods (including the runner pod).
+    # The cert-manager TLS secret contains ca.crt which GitLab injects into
+    # each pod's system trust store via its certificate init container.
+    certs_cfg = _ensure_map(global_cfg, "certificates")
+    certs_cfg["customCAs"] = [{"secret": tls_secret_name}]
+
+    # Runner job pods: mount the cert-manager TLS secret so job containers
+    # can call update-ca-certificates and trust the GitLab CA.
+    runner_cfg = _ensure_map(merged, "gitlab-runner")
+    runner_cfg["runners"] = {
+        "config": (
+            "[[runners]]\n"
+            "  [runners.kubernetes]\n"
+            "    privileged = true\n"
+            "  [[runners.kubernetes.volumes.secret]]\n"
+            f'    name = "{tls_secret_name}"\n'
+            '    mount_path = "/usr/local/share/ca-certificates/"\n'
+            "    read_only = true\n"
+        )
+    }
 
     return merged
 
 
+# ---- cert-manager helpers --------------------------------------------------
+def _ensure_certificate(instance: Dict[str, Any], namespace: str) -> str:
+    """Create or update a cert-manager Certificate for this GitLab instance.
+
+    Returns the TLS secret name that cert-manager will populate.
+    """
+    instance_name = instance["metadata"]["name"]
+    domain = instance.get("spec", {}).get("domain", "")
+    spec = instance.get("spec", {})
+    issuer = _resolve_cert_manager_issuer(spec)
+    tls_secret_name = _instance_tls_secret_name(instance_name)
+
+    dns_names = [
+        f"gitlab-{instance_name}.{domain}",
+        f"registry-{instance_name}.{domain}",
+        f"minio-{instance_name}.{domain}",
+    ]
+
+    cert_body: Dict[str, Any] = {
+        "apiVersion": "cert-manager.io/v1",
+        "kind": "Certificate",
+        "metadata": {
+            "name": tls_secret_name,
+            "namespace": namespace,
+        },
+        "spec": {
+            "secretName": tls_secret_name,
+            "issuerRef": {
+                "name": issuer["name"],
+                "kind": issuer["kind"],
+            },
+            "dnsNames": dns_names,
+        },
+    }
+
+    owner_ref = _owner_reference_for_instance(instance)
+    if owner_ref.get("uid"):
+        cert_body["metadata"]["ownerReferences"] = [owner_ref]
+
+    logger.info(
+        "Ensuring cert-manager Certificate '%s' in namespace '%s' "
+        "using %s '%s' for domains: %s",
+        tls_secret_name,
+        namespace,
+        issuer["kind"],
+        issuer["name"],
+        ", ".join(dns_names),
+    )
+
+    api = kubernetes.client.CustomObjectsApi()
+    try:
+        api.create_namespaced_custom_object(
+            group="cert-manager.io",
+            version="v1",
+            namespace=namespace,
+            plural="certificates",
+            body=cert_body,
+        )
+        logger.info("Created Certificate '%s'.", tls_secret_name)
+    except kubernetes.client.exceptions.ApiException as exc:
+        if exc.status == 409:
+            api.patch_namespaced_custom_object(
+                group="cert-manager.io",
+                version="v1",
+                namespace=namespace,
+                plural="certificates",
+                name=tls_secret_name,
+                body=cert_body,
+            )
+            logger.info("Updated existing Certificate '%s'.", tls_secret_name)
+        else:
+            raise kopf.TemporaryError(
+                f"Failed to create Certificate '{tls_secret_name}': {exc}", delay=20
+            ) from exc
+
+    return tls_secret_name
+
+
+def _ensure_tls_secret_ready(namespace: str, secret_name: str) -> None:
+    """Raise TemporaryError if the cert-manager TLS secret is not yet populated."""
+    v1 = kubernetes.client.CoreV1Api()
+    try:
+        secret = v1.read_namespaced_secret(secret_name, namespace)
+    except kubernetes.client.exceptions.ApiException as exc:
+        if exc.status == 404:
+            raise kopf.TemporaryError(
+                f"Waiting for cert-manager to create TLS secret '{secret_name}'. "
+                "Check the Certificate resource status and ClusterIssuer configuration.",
+                delay=15,
+            ) from exc
+        raise kopf.TemporaryError(
+            f"Error reading TLS secret '{secret_name}': {exc}", delay=10
+        ) from exc
+    if not secret.data or "tls.crt" not in secret.data or "tls.key" not in secret.data:
+        raise kopf.TemporaryError(
+            f"TLS secret '{secret_name}' is not yet fully populated by cert-manager.",
+            delay=10,
+        )
+
+
 # ---- Kubernetes API helpers ------------------------------------------------
+def _resolve_instance_ref(
+    instance_ref: Any, default_namespace: str
+) -> tuple[str, str]:
+    """Return (name, namespace) from an instanceRef object."""
+    if isinstance(instance_ref, dict):
+        return instance_ref["name"], instance_ref.get("namespace", default_namespace)
+    # Fallback for legacy string values (should not occur after CRD migration).
+    return str(instance_ref), default_namespace
+
+
 def _get_instance(namespace: str, name: str) -> Dict[str, Any]:
     api = kubernetes.client.CustomObjectsApi()
     return api.get_namespaced_custom_object(
@@ -280,7 +412,9 @@ def _get_instance(namespace: str, name: str) -> Dict[str, Any]:
     )
 
 
-def _list_users_for_instance(namespace: str, instance_name: str) -> list[Dict[str, Any]]:
+def _list_users_for_instance(
+    namespace: str, instance_name: str
+) -> list[Dict[str, Any]]:
     api = kubernetes.client.CustomObjectsApi()
     users = api.list_namespaced_custom_object(
         group=GROUP,
@@ -289,7 +423,13 @@ def _list_users_for_instance(namespace: str, instance_name: str) -> list[Dict[st
         plural="gitlabusers",
     )
     items = users.get("items", []) if isinstance(users, dict) else []
-    return [u for u in items if u.get("spec", {}).get("instanceRef") == instance_name]
+    def _matches(user: Dict[str, Any]) -> bool:
+        ref = user.get("spec", {}).get("instanceRef")
+        if isinstance(ref, dict):
+            return ref.get("name") == instance_name
+        return ref == instance_name
+
+    return [u for u in items if _matches(u)]
 
 
 def _delete_users_for_instance(namespace: str, instance_name: str) -> int:
@@ -381,7 +521,9 @@ def _extract_pat_token(output: str) -> Optional[str]:
     return None
 
 
-def _generate_root_pat(namespace: str, release: str, token_name: str, expires_days: int) -> str:
+def _generate_root_pat(
+    namespace: str, release: str, token_name: str, expires_days: int
+) -> str:
     # Generate PAT inside toolbox pod so token creation follows GitLab internals.
     pod_name = _toolbox_pod_name(namespace, release)
     safe_token_name = token_name.replace("\\", "\\\\").replace("'", "\\'")
@@ -412,10 +554,14 @@ puts token.token
             tty=False,
         )
     except Exception as exc:
-        raise kopf.TemporaryError(f"Failed to generate root PAT from toolbox pod: {exc}", delay=20) from exc
+        raise kopf.TemporaryError(
+            f"Failed to generate root PAT from toolbox pod: {exc}", delay=20
+        ) from exc
     pat = _extract_pat_token(output or "")
     if not pat:
-        raise kopf.TemporaryError("Failed to extract generated PAT from toolbox output.", delay=20)
+        raise kopf.TemporaryError(
+            "Failed to extract generated PAT from toolbox output.", delay=20
+        )
     return pat
 
 
@@ -430,14 +576,16 @@ def _upsert_secret_token(
     encoded = base64.b64encode(token.encode("utf-8")).decode("utf-8")
     metadata = kubernetes.client.V1ObjectMeta(name=secret_name, namespace=namespace)
     if owner_reference:
-        metadata.owner_references = [kubernetes.client.V1OwnerReference(
-            api_version=owner_reference["apiVersion"],
-            kind=owner_reference["kind"],
-            name=owner_reference["name"],
-            uid=owner_reference["uid"],
-            controller=owner_reference.get("controller", False),
-            block_owner_deletion=owner_reference.get("blockOwnerDeletion", False),
-        )]
+        metadata.owner_references = [
+            kubernetes.client.V1OwnerReference(
+                api_version=owner_reference["apiVersion"],
+                kind=owner_reference["kind"],
+                name=owner_reference["name"],
+                uid=owner_reference["uid"],
+                controller=owner_reference.get("controller", False),
+                block_owner_deletion=owner_reference.get("blockOwnerDeletion", False),
+            )
+        ]
     body = kubernetes.client.V1Secret(
         metadata=metadata,
         type="Opaque",
@@ -471,7 +619,9 @@ def _ensure_bootstrap_pat_secret(
         token_name=f"{DEFAULT_BOOTSTRAP_PAT_NAME}-{instance_name}",
         expires_days=DEFAULT_BOOTSTRAP_PAT_EXPIRES_DAYS,
     )
-    _upsert_secret_token(namespace, secret_name, key, token, owner_reference=owner_reference)
+    _upsert_secret_token(
+        namespace, secret_name, key, token, owner_reference=owner_reference
+    )
     return secret_name
 
 
@@ -496,7 +646,9 @@ def _instance_pat_token(
         except kopf.TemporaryError:
             if secret_name != default_secret_name:
                 raise
-            _ensure_bootstrap_pat_secret(namespace=namespace, release=release, instance_name=instance_name)
+            _ensure_bootstrap_pat_secret(
+                namespace=namespace, release=release, instance_name=instance_name
+            )
     raise kopf.TemporaryError(
         f"Failed to read bootstrap PAT secret '{secret_name}/{key}' after recreation attempt.",
         delay=20,
@@ -516,10 +668,14 @@ def _owner_reference_for_instance(instance: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _ensure_instance_owner_reference(patch: Dict[str, Any], instance: Dict[str, Any]) -> None:
+def _ensure_instance_owner_reference(
+    patch: Dict[str, Any], instance: Dict[str, Any]
+) -> None:
     owner_ref = _owner_reference_for_instance(instance)
     if not owner_ref.get("name") or not owner_ref.get("uid"):
-        raise kopf.TemporaryError("GitLabInstance metadata is missing name/uid for ownerReference.", delay=10)
+        raise kopf.TemporaryError(
+            "GitLabInstance metadata is missing name/uid for ownerReference.", delay=10
+        )
     metadata_patch = patch.setdefault("metadata", {})
     refs = metadata_patch.setdefault("ownerReferences", [])
     if any(ref.get("uid") == owner_ref["uid"] for ref in refs):
@@ -528,7 +684,9 @@ def _ensure_instance_owner_reference(patch: Dict[str, Any], instance: Dict[str, 
 
 
 # ---- GitLab API helpers ----------------------------------------------------
-def _gitlab_api(url: str, token: str, method: str, path: str, verify: bool = True, **kwargs: Any) -> Any:
+def _gitlab_api(
+    url: str, token: str, method: str, path: str, verify: bool = True, **kwargs: Any
+) -> Any:
     try:
         req = requests.request(
             method=method,
@@ -542,12 +700,16 @@ def _gitlab_api(url: str, token: str, method: str, path: str, verify: bool = Tru
         hint = ""
         if verify:
             hint = (
-                " (ensure spec.caSecretRef points to your in-namespace CA secret, "
+                " (check the cert-manager Certificate resource status in the instance namespace, "
                 "or set spec.insecureSkipTlsVerify: true for disposable environments)"
             )
-        raise kopf.TemporaryError(f"TLS verification failed contacting GitLab{hint}: {exc}", delay=30) from exc
+        raise kopf.TemporaryError(
+            f"TLS verification failed contacting GitLab{hint}: {exc}", delay=30
+        ) from exc
     except requests.exceptions.RequestException as exc:
-        raise kopf.TemporaryError(f"GitLab API connection error: {exc}", delay=20) from exc
+        raise kopf.TemporaryError(
+            f"GitLab API connection error: {exc}", delay=20
+        ) from exc
     if req.status_code == 429:
         retry_after = int(req.headers.get("Retry-After", "60"))
         raise kopf.TemporaryError(
@@ -563,7 +725,9 @@ def _gitlab_api(url: str, token: str, method: str, path: str, verify: bool = Tru
             delay=20,
         )
     if req.status_code >= 400:
-        raise kopf.TemporaryError(f"GitLab API {method} {path} failed: {req.status_code} {req.text}", delay=10)
+        raise kopf.TemporaryError(
+            f"GitLab API {method} {path} failed: {req.status_code} {req.text}", delay=10
+        )
     remaining = req.headers.get("RateLimit-Remaining")
     if remaining is not None and int(remaining) < 5:
         reset = int(req.headers.get("RateLimit-Reset", "0"))
@@ -575,8 +739,12 @@ def _gitlab_api(url: str, token: str, method: str, path: str, verify: bool = Tru
     return req.json()
 
 
-def _ensure_import_sources(gitlab_url: str, token: str, required: list[str], verify: bool) -> None:
-    settings = _gitlab_api(gitlab_url, token, "GET", "/api/v4/application/settings", verify=verify)
+def _ensure_import_sources(
+    gitlab_url: str, token: str, required: list[str], verify: bool
+) -> None:
+    settings = _gitlab_api(
+        gitlab_url, token, "GET", "/api/v4/application/settings", verify=verify
+    )
     existing = settings.get("import_sources", []) if isinstance(settings, dict) else []
     current = set(existing if isinstance(existing, list) else [])
     target = sorted(current.union(required))
@@ -607,12 +775,30 @@ def _ensure_repository_for_user(
     full_path = f"{username}/{project_path}"
     encoded = requests.utils.quote(full_path, safe="")
 
-    existing_project = _gitlab_api(gitlab_url, token, "GET", f"/api/v4/projects/{encoded}", verify=verify_tls)
+    existing_project = _gitlab_api(
+        gitlab_url, token, "GET", f"/api/v4/projects/{encoded}", verify=verify_tls
+    )
     if existing_project is None:
-        namespaces = _gitlab_api(gitlab_url, token, "GET", "/api/v4/namespaces", verify=verify_tls, params={"search": username})
-        namespace_id = next((ns["id"] for ns in namespaces if ns.get("full_path") == username or ns.get("path") == username), None)
+        namespaces = _gitlab_api(
+            gitlab_url,
+            token,
+            "GET",
+            "/api/v4/namespaces",
+            verify=verify_tls,
+            params={"search": username},
+        )
+        namespace_id = next(
+            (
+                ns["id"]
+                for ns in namespaces
+                if ns.get("full_path") == username or ns.get("path") == username
+            ),
+            None,
+        )
         if namespace_id is None:
-            raise kopf.TemporaryError(f"User namespace not found in GitLab for '{username}'", delay=10)
+            raise kopf.TemporaryError(
+                f"User namespace not found in GitLab for '{username}'", delay=10
+            )
 
         payload = {
             "name": project_name,
@@ -623,18 +809,43 @@ def _ensure_repository_for_user(
         if import_url:
             # Explicit import requested: fail/retry if import cannot be performed.
             payload["import_url"] = import_url
-            _ensure_import_sources(gitlab_url, token, ["git", "github"], verify=verify_tls)
-            _gitlab_api(gitlab_url, token, "POST", "/api/v4/projects", verify=verify_tls, json=payload)
+            _ensure_import_sources(
+                gitlab_url, token, ["git", "github"], verify=verify_tls
+            )
+            _gitlab_api(
+                gitlab_url,
+                token,
+                "POST",
+                "/api/v4/projects",
+                verify=verify_tls,
+                json=payload,
+            )
         else:
             # No import URL requested: initialize an empty repository.
             payload["initialize_with_readme"] = True
-            _gitlab_api(gitlab_url, token, "POST", "/api/v4/projects", verify=verify_tls, json=payload)
+            _gitlab_api(
+                gitlab_url,
+                token,
+                "POST",
+                "/api/v4/projects",
+                verify=verify_tls,
+                json=payload,
+            )
 
     return {"fullPath": full_path, "webUrl": f"{gitlab_url}/{full_path}"}
 
 
-def _lookup_gitlab_user(gitlab_url: str, token: str, username: str, verify_tls: bool | str) -> Optional[Dict[str, Any]]:
-    users = _gitlab_api(gitlab_url, token, "GET", "/api/v4/users", verify=verify_tls, params={"username": username})
+def _lookup_gitlab_user(
+    gitlab_url: str, token: str, username: str, verify_tls: bool | str
+) -> Optional[Dict[str, Any]]:
+    users = _gitlab_api(
+        gitlab_url,
+        token,
+        "GET",
+        "/api/v4/users",
+        verify=verify_tls,
+        params={"username": username},
+    )
     if not isinstance(users, list):
         return None
     for user in users:
@@ -654,17 +865,25 @@ def _delete_repository_for_user(
     project_path = repo_spec.get("projectPath", "workshop-repo")
     full_path = f"{username}/{project_path}"
     encoded = requests.utils.quote(full_path, safe="")
-    existing_project = _gitlab_api(gitlab_url, token, "GET", f"/api/v4/projects/{encoded}", verify=verify_tls)
+    existing_project = _gitlab_api(
+        gitlab_url, token, "GET", f"/api/v4/projects/{encoded}", verify=verify_tls
+    )
     if existing_project is None:
         return
-    project_id = existing_project.get("id") if isinstance(existing_project, dict) else None
+    project_id = (
+        existing_project.get("id") if isinstance(existing_project, dict) else None
+    )
     if project_id is None:
         return
-    _gitlab_api(gitlab_url, token, "DELETE", f"/api/v4/projects/{project_id}", verify=verify_tls)
+    _gitlab_api(
+        gitlab_url, token, "DELETE", f"/api/v4/projects/{project_id}", verify=verify_tls
+    )
 
 
 # ---- Status helpers --------------------------------------------------------
-def _patch_status(namespace: str, plural: str, name: str, status: Dict[str, Any]) -> None:
+def _patch_status(
+    namespace: str, plural: str, name: str, status: Dict[str, Any]
+) -> None:
     """Immediately patch the status subresource so watchers see real-time progress."""
     api = kubernetes.client.CustomObjectsApi()
     api.patch_namespaced_custom_object_status(
@@ -690,14 +909,30 @@ def configure(settings: kopf.OperatorSettings, **_: Any) -> None:
 
 @kopf.on.create(GROUP, VERSION, "gitlabinstances")
 @kopf.on.update(GROUP, VERSION, "gitlabinstances")
-def reconcile_instance(spec: Dict[str, Any], body: Dict[str, Any], namespace: str, patch: Dict[str, Any], **_: Any) -> None:
+def reconcile_instance(
+    spec: Dict[str, Any],
+    body: Dict[str, Any],
+    namespace: str,
+    patch: Dict[str, Any],
+    **_: Any,
+) -> None:
     instance_name = body.get("metadata", {}).get("name", "gitlab")
 
     # Immediately mark as in-progress so watchers see real-time status.
-    _patch_status(namespace, "gitlabinstances", instance_name, {
-        "ready": False,
-        "message": "Reconciling GitLab instance.",
-    })
+    _patch_status(
+        namespace,
+        "gitlabinstances",
+        instance_name,
+        {
+            "ready": False,
+            "message": "Reconciling GitLab instance.",
+        },
+    )
+
+    # Ensure a cert-manager Certificate exists and its TLS secret is ready
+    # before running the Helm install (the ingress depends on the TLS secret).
+    tls_secret_name = _ensure_certificate(body, namespace)
+    _ensure_tls_secret_ready(namespace, tls_secret_name)
 
     values_path = _instance_values_file(body)
     release = _instance_release_name(body)
@@ -738,7 +973,9 @@ def reconcile_instance(spec: Dict[str, Any], body: Dict[str, Any], namespace: st
 
     owner_ref = _owner_reference_for_instance(body)
     bootstrap_secret = _ensure_bootstrap_pat_secret(
-        namespace, release, instance_name,
+        namespace,
+        release,
+        instance_name,
         owner_reference=owner_ref if owner_ref.get("uid") else None,
     )
 
@@ -754,6 +991,7 @@ def reconcile_instance(spec: Dict[str, Any], body: Dict[str, Any], namespace: st
         reason="GitLabInstanceReconciled",
         message=f"Helm release reconciled: release={release}",
     )
+
 
 @kopf.on.delete(GROUP, VERSION, "gitlabinstances", optional=True)
 def delete_instance(body: Dict[str, Any], namespace: str, **_: Any) -> None:
@@ -786,90 +1024,124 @@ def delete_instance(body: Dict[str, Any], namespace: str, **_: Any) -> None:
 
 @kopf.on.create(GROUP, VERSION, "gitlabusers")
 @kopf.on.update(GROUP, VERSION, "gitlabusers")
-def reconcile_user(spec: Dict[str, Any], body: Dict[str, Any], namespace: str, patch: Dict[str, Any], **_: Any) -> None:
+def reconcile_user(
+    spec: Dict[str, Any],
+    body: Dict[str, Any],
+    namespace: str,
+    patch: Dict[str, Any],
+    **_: Any,
+) -> None:
     username = body.get("metadata", {}).get("name")
     if not username:
         raise kopf.PermanentError("GitLabUser metadata.name is required.")
 
     # Immediately mark as in-progress so watchers see real-time status.
-    _patch_status(namespace, "gitlabusers", username, {
-        "ready": False,
-        "message": "Accepted. Reconciling GitLab user.",
-    })
+    _patch_status(
+        namespace,
+        "gitlabusers",
+        username,
+        {
+            "ready": False,
+            "message": "Accepted. Reconciling GitLab user.",
+        },
+    )
 
-    instance = _get_instance(namespace, spec["instanceRef"])
-    _ensure_instance_owner_reference(patch, instance)
+    instance_name, instance_namespace = _resolve_instance_ref(
+        spec["instanceRef"], namespace
+    )
+    instance = _get_instance(instance_namespace, instance_name)
+    # Owner references are only valid within the same namespace; skip when the
+    # GitLabInstance lives in a different namespace to avoid the GC deleting the user.
+    if instance_namespace == namespace:
+        _ensure_instance_owner_reference(patch, instance)
 
     # Gate on instance readiness to avoid hammering a not-yet-ready GitLab.
     if not instance.get("status", {}).get("ready"):
         raise kopf.TemporaryError(
-            f"GitLabInstance '{spec['instanceRef']}' is not ready yet.",
+            f"GitLabInstance '{instance_namespace}/{instance_name}' is not ready yet.",
             delay=15,
         )
 
-    gitlab_url = instance.get("status", {}).get("gitlabUrl") or _instance_gitlab_url(instance)
+    # External URL is stored in status for user-facing access.
+    gitlab_url = instance.get("status", {}).get("gitlabUrl") or _instance_gitlab_url(
+        instance
+    )
+    # Internal cluster URL used for all API calls — plain HTTP, no TLS.
+    api_url = _instance_internal_url(instance, instance_namespace)
 
-    # Resolve TLS verification and PAT inside try/finally to ensure CA temp
-    # file cleanup even if token resolution or API calls fail.
-    ca_path = None
-    try:
-        verify_tls, ca_path = _instance_verify_arg(instance, namespace)
+    token = _instance_pat_token(
+        namespace=instance_namespace,
+        instance=instance,
+        token_secret_ref=spec.get("tokenSecretRef"),
+    )
 
-        token = _instance_pat_token(
-            namespace=namespace,
-            instance=instance,
-            token_secret_ref=spec.get("tokenSecretRef"),
+    repositories = spec.get("repositories", [])
+    if repositories is None:
+        repositories = []
+    if not isinstance(repositories, list):
+        raise kopf.PermanentError(
+            "GitLabUser spec.repositories must be a list when provided."
         )
 
-        repositories = spec.get("repositories", [])
-        if repositories is None:
-            repositories = []
-        if not isinstance(repositories, list):
-            raise kopf.PermanentError("GitLabUser spec.repositories must be a list when provided.")
-
-        existing = _gitlab_api(gitlab_url, token, "GET", "/api/v4/users", verify=verify_tls, params={"username": username})
-        if not existing:
-            payload = {
+    existing = _gitlab_api(
+        api_url,
+        token,
+        "GET",
+        "/api/v4/users",
+        verify=False,
+        params={"username": username},
+    )
+    if not existing:
+        payload = {
+            "email": spec.get("email", f"{username}@educates.test"),
+            "username": username,
+            "name": spec.get("name", username),
+            "password": spec["password"],
+            "skip_confirmation": True,
+            "admin": spec.get("admin", False),
+        }
+        _gitlab_api(
+            api_url,
+            token,
+            "POST",
+            "/api/v4/users",
+            verify=False,
+            json=payload,
+        )
+    else:
+        # Update existing user to reflect spec changes (password, email, admin, etc.).
+        existing_user = existing[0] if isinstance(existing, list) else existing
+        if isinstance(existing_user, dict) and existing_user.get("id"):
+            update_payload = {
                 "email": spec.get("email", f"{username}@educates.test"),
-                "username": username,
                 "name": spec.get("name", username),
                 "password": spec["password"],
-                "skip_confirmation": True,
                 "admin": spec.get("admin", False),
             }
-            _gitlab_api(gitlab_url, token, "POST", "/api/v4/users", verify=verify_tls, json=payload)
-        else:
-            # Update existing user to reflect spec changes (password, email, admin, etc.).
-            existing_user = existing[0] if isinstance(existing, list) else existing
-            if isinstance(existing_user, dict) and existing_user.get("id"):
-                update_payload = {
-                    "email": spec.get("email", f"{username}@educates.test"),
-                    "name": spec.get("name", username),
-                    "password": spec["password"],
-                    "admin": spec.get("admin", False),
-                }
-                _gitlab_api(
-                    gitlab_url, token, "PUT",
-                    f"/api/v4/users/{existing_user['id']}",
-                    verify=verify_tls, json=update_payload,
-                )
-
-        repo_results = []
-        for repo in repositories:
-            if not isinstance(repo, dict):
-                raise kopf.PermanentError("Each item in GitLabUser spec.repositories must be an object.")
-            repo_results.append(
-                _ensure_repository_for_user(
-                    gitlab_url=gitlab_url,
-                    token=token,
-                    verify_tls=verify_tls,
-                    username=username,
-                    repo_spec=repo,
-                )
+            _gitlab_api(
+                api_url,
+                token,
+                "PUT",
+                f"/api/v4/users/{existing_user['id']}",
+                verify=False,
+                json=update_payload,
             )
-    finally:
-        if ca_path and os.path.exists(ca_path):
-            os.remove(ca_path)
+
+    repo_results = []
+    for repo in repositories:
+        if not isinstance(repo, dict):
+            raise kopf.PermanentError(
+                "Each item in GitLabUser spec.repositories must be an object."
+            )
+        repo_results.append(
+            _ensure_repository_for_user(
+                gitlab_url=api_url,
+                token=token,
+                verify_tls=False,
+                username=username,
+                repo_spec=repo,
+            )
+        )
 
     patch.setdefault("status", {})
     patch["status"]["ready"] = True
@@ -887,14 +1159,18 @@ def reconcile_user(spec: Dict[str, Any], body: Dict[str, Any], namespace: str, p
 
 
 @kopf.on.delete(GROUP, VERSION, "gitlabusers", optional=True)
-def delete_user(spec: Dict[str, Any], body: Dict[str, Any], namespace: str, **_: Any) -> None:
-    ca_path = None
-    verify_tls: bool | str = True
+def delete_user(
+    spec: Dict[str, Any], body: Dict[str, Any], namespace: str, **_: Any
+) -> None:
     instance = None
-    gitlab_url = body.get("status", {}).get("gitlabUrl")
+    # Fall back to the URL cached in status if the instance is already gone.
+    api_url = body.get("status", {}).get("gitlabUrl")
+    instance_name, instance_namespace = _resolve_instance_ref(
+        spec.get("instanceRef", {}), namespace
+    )
     try:
-        instance = _get_instance(namespace, spec["instanceRef"])
-        gitlab_url = instance.get("status", {}).get("gitlabUrl") or _instance_gitlab_url(instance)
+        instance = _get_instance(instance_namespace, instance_name)
+        api_url = _instance_internal_url(instance, instance_namespace)
     except kubernetes.client.exceptions.ApiException as exc:
         if exc.status != 404:
             raise
@@ -902,35 +1178,28 @@ def delete_user(spec: Dict[str, Any], body: Dict[str, Any], namespace: str, **_:
             body,
             type="Warning",
             reason="InstanceNotFoundOnUserDelete",
-            message=f"GitLabInstance '{spec.get('instanceRef')}' not found; proceeding with best-effort user cleanup.",
+            message=f"GitLabInstance '{instance_namespace}/{instance_name}' not found; proceeding with best-effort user cleanup.",
         )
-
-    # Resolve TLS verification — if the CA secret is already gone (namespace
-    # teardown), fall back to insecure so deletion is not blocked forever.
-    if instance is not None:
-        try:
-            verify_tls, ca_path = _instance_verify_arg(instance, namespace)
-        except kopf.TemporaryError:
-            verify_tls = False
-            kopf.event(
-                body,
-                type="Warning",
-                reason="TLSFallbackOnDelete",
-                message="CA secret unavailable during deletion; falling back to insecure TLS for cleanup.",
-            )
 
     # Resolve PAT token — same best-effort approach.
     token = None
     try:
         if instance is not None:
             token = _instance_pat_token(
-                namespace=namespace,
+                namespace=instance_namespace,
                 instance=instance,
                 token_secret_ref=spec.get("tokenSecretRef"),
             )
         else:
-            ref = spec.get("tokenSecretRef") if isinstance(spec.get("tokenSecretRef"), dict) else {}
-            secret_name = ref.get("name", _instance_bootstrap_pat_secret_name(spec.get("instanceRef", "gitlab")))
+            ref = (
+                spec.get("tokenSecretRef")
+                if isinstance(spec.get("tokenSecretRef"), dict)
+                else {}
+            )
+            secret_name = ref.get(
+                "name",
+                _instance_bootstrap_pat_secret_name(instance_name or "gitlab"),
+            )
             key = ref.get("key", DEFAULT_BOOTSTRAP_PAT_KEY)
             token = _secret_value(namespace, secret_name, key).strip()
     except kopf.TemporaryError:
@@ -944,43 +1213,45 @@ def delete_user(spec: Dict[str, Any], body: Dict[str, Any], namespace: str, **_:
 
     deleted_repos = 0
     deleted_user = False
-    try:
-        if not gitlab_url or not token:
-            kopf.event(
-                body,
-                type="Warning",
-                reason="GitLabCleanupSkipped",
-                message="Skipping remote GitLab cleanup because URL or token is unavailable; allowing Kubernetes resource deletion.",
-            )
-            return
-
-        for repo in repositories:
-            if isinstance(repo, dict):
-                _delete_repository_for_user(
-                    gitlab_url=gitlab_url,
-                    token=token,
-                    verify_tls=verify_tls,
-                    username=username,
-                    repo_spec=repo,
-                )
-                deleted_repos += 1
-
-        user = _lookup_gitlab_user(gitlab_url, token, username, verify_tls)
-        if user and user.get("id") is not None:
-            _gitlab_api(gitlab_url, token, "DELETE", f"/api/v4/users/{user['id']}", verify=verify_tls)
-            deleted_user = True
+    if not api_url or not token:
         kopf.event(
             body,
-            type="Normal",
-            reason="GitLabCleanup",
-            message=(
-                f"Remote cleanup completed: repositories_processed={deleted_repos}, "
-                f"user_deleted={str(deleted_user).lower()}, username={username}"
-            ),
+            type="Warning",
+            reason="GitLabCleanupSkipped",
+            message="Skipping remote GitLab cleanup because URL or token is unavailable; allowing Kubernetes resource deletion.",
         )
-    finally:
-        if ca_path and os.path.exists(ca_path):
-            os.remove(ca_path)
+        return
+
+    for repo in repositories:
+        if isinstance(repo, dict):
+            _delete_repository_for_user(
+                gitlab_url=api_url,
+                token=token,
+                verify_tls=False,
+                username=username,
+                repo_spec=repo,
+            )
+            deleted_repos += 1
+
+    user = _lookup_gitlab_user(api_url, token, username, False)
+    if user and user.get("id") is not None:
+        _gitlab_api(
+            api_url,
+            token,
+            "DELETE",
+            f"/api/v4/users/{user['id']}",
+            verify=False,
+        )
+        deleted_user = True
+    kopf.event(
+        body,
+        type="Normal",
+        reason="GitLabCleanup",
+        message=(
+            f"Remote cleanup completed: repositories_processed={deleted_repos}, "
+            f"user_deleted={str(deleted_user).lower()}, username={username}"
+        ),
+    )
 
 
 # ---- Liveness probe -------------------------------------------------------

@@ -7,7 +7,7 @@ helm_namespace := "educates-gitlab-operator"
 
 # Build and push operator container image to local registry
 build-image:
-    docker build -t localhost:5001/educates-gitlab-operator:latest -f operator/Dockerfile . --push
+    (cd operator; docker build -t localhost:5001/educates-gitlab-operator:latest -f Dockerfile . --push)
 
 # Install operator via Helm chart
 install *ARGS:
@@ -23,8 +23,8 @@ template *ARGS:
 
 # Run operator locally (requires kubeconfig)
 run:
-    cd operator && uv run kopf run --standalone --all-namespaces --liveness=http://0.0.0.0:8080/healthz main.py
+    (cd operator; uv run kopf run --standalone --all-namespaces --liveness=http://0.0.0.0:8080/healthz main.py)
 
 # Format Python code
 format:
-    cd operator && uv run black --exclude='.venv' .
+    (cd operator; uv run black --exclude='.venv' .)

@@ -30,7 +30,9 @@ nginx-ingress:
 prometheus:
   install: false
 gitlab-runner:
-  install: false
+  install: true
+  # certSecretName and runner CA volumes are set dynamically by the operator
+  # based on the cert-manager-issued TLS secret for each GitLabInstance.
 gitlab-zoekt:
   install: false
 

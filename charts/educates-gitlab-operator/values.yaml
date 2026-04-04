@@ -7,7 +7,7 @@ image:
 
 namespace:
   create: false
-  name: gitlab-operator-system
+  name: educates-gitlab-operator
 
 serviceAccount:
   create: true
@@ -19,11 +19,9 @@ rbac:
   clusterRoleBindingName: educates-gitlab-operator
 
 gitlab:
-  # Operator-level TLS/CA defaults applied to all GitLabInstances.
-  # Instance CR fields override these when set.
-  tlsSecretName: ""
-  caSecretName: ""
-  caSecretKey: ""
+  # Operator-level cert-manager defaults applied to all GitLabInstances.
+  # Instance CR spec.certManagerIssuerRef overrides this when set.
+  certManagerIssuerName: "educateswildcard"
   insecureSkipTlsVerify: false
 
 podLabels: {}

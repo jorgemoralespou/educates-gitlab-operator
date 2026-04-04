@@ -25,20 +25,9 @@ spec:
         - name: operator
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          {{- if or .Values.gitlab.tlsSecretName .Values.gitlab.caSecretName .Values.gitlab.insecureSkipTlsVerify .Values.extraEnv }}
           env:
-            {{- if .Values.gitlab.tlsSecretName }}
-            - name: GITLAB_TLS_SECRET_NAME
-              value: {{ .Values.gitlab.tlsSecretName | quote }}
-            {{- end }}
-            {{- if .Values.gitlab.caSecretName }}
-            - name: GITLAB_CA_SECRET_NAME
-              value: {{ .Values.gitlab.caSecretName | quote }}
-            {{- end }}
-            {{- if .Values.gitlab.caSecretKey }}
-            - name: GITLAB_CA_SECRET_KEY
-              value: {{ .Values.gitlab.caSecretKey | quote }}
-            {{- end }}
+            - name: GITLAB_CERT_MANAGER_ISSUER_NAME
+              value: {{ .Values.gitlab.certManagerIssuerName | quote }}
             {{- if .Values.gitlab.insecureSkipTlsVerify }}
             - name: GITLAB_INSECURE_SKIP_TLS_VERIFY
               value: "true"
@@ -46,7 +35,6 @@ spec:
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
-          {{- end }}
           ports:
             - name: probes
               containerPort: 8080

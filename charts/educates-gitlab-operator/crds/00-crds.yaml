@@ -38,17 +38,12 @@ spec:
                   type: string
                 insecureSkipTlsVerify:
                   type: boolean
-                tlsSecretRef:
+                certManagerIssuerRef:
                   type: object
                   properties:
                     name:
                       type: string
-                caSecretRef:
-                  type: object
-                  properties:
-                    name:
-                      type: string
-                    key:
+                    kind:
                       type: string
                 chartVersion:
                   type: string
@@ -85,7 +80,7 @@ spec:
           jsonPath: .spec.password
         - name: GitLabInstance
           type: string
-          jsonPath: .spec.instanceRef
+          jsonPath: .spec.instanceRef.name
         - name: Ready
           type: string
           jsonPath: .status.ready
@@ -101,7 +96,13 @@ spec:
               required: [instanceRef, password]
               properties:
                 instanceRef:
-                  type: string
+                  type: object
+                  required: [name]
+                  properties:
+                    name:
+                      type: string
+                    namespace:
+                      type: string
                 password:
                   type: string
                 email:

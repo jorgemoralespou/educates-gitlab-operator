@@ -1,9 +1,9 @@
 apiVersion: training.educates.dev/v1beta1
 kind: Workshop
 metadata:
-  name: lab-gitlab-operator
+  name: lab-gitlab-operator-vc
 spec:
-  title: GitLab Operator Showcase
+  title: GitLab Operator Showcase VC
   description: Deploy a GitLab server and user through Kubernetes custom resources managed by the GitLab Workshop Operator.
   vendor: Educates
   difficulty: intermediate
@@ -35,51 +35,53 @@ spec:
         enabled: true
       console:
         enabled: true
-    objects:
-    - apiVersion: rbac.authorization.k8s.io/v1
-      kind: Role
-      metadata:
-        name: gitlab-operator-session
-      rules:
-      - apiGroups:
-        - gitlab.operators.educates.dev
-        resources:
-        - gitlabinstances
-        - gitlabusers
-        verbs:
-        - get
-        - list
-        - watch
-        - create
-        - update
-        - patch
-        - delete
-      - apiGroups:
-        - gitlab.operators.educates.dev
-        resources:
-        - gitlabinstances/status
-        - gitlabusers/status
-        verbs:
-        - get
-        - update
-        - patch
-      - apiGroups:
-        - ""
-        resources:
-        - secrets
-        verbs:
-        - get
-        - list
-        - watch
-    - apiVersion: rbac.authorization.k8s.io/v1
-      kind: RoleBinding
-      metadata:
-        name: gitlab-operator-session
-      roleRef:
-        apiGroup: rbac.authorization.k8s.io
-        kind: Role
-        name: gitlab-operator-session
-      subjects:
-      - kind: ServiceAccount
-        namespace: $(workshop_namespace)
-        name: $(service_account)
+      vcluster:
+        enabled: true
+    # objects:
+    # - apiVersion: rbac.authorization.k8s.io/v1
+    #   kind: Role
+    #   metadata:
+    #     name: gitlab-operator-session
+    #   rules:
+    #   - apiGroups:
+    #     - gitlab.operators.educates.dev
+    #     resources:
+    #     - gitlabinstances
+    #     - gitlabusers
+    #     verbs:
+    #     - get
+    #     - list
+    #     - watch
+    #     - create
+    #     - update
+    #     - patch
+    #     - delete
+    #   - apiGroups:
+    #     - gitlab.operators.educates.dev
+    #     resources:
+    #     - gitlabinstances/status
+    #     - gitlabusers/status
+    #     verbs:
+    #     - get
+    #     - update
+    #     - patch
+    #   - apiGroups:
+    #     - ""
+    #     resources:
+    #     - secrets
+    #     verbs:
+    #     - get
+    #     - list
+    #     - watch
+    # - apiVersion: rbac.authorization.k8s.io/v1
+    #   kind: RoleBinding
+    #   metadata:
+    #     name: gitlab-operator-session
+    #   roleRef:
+    #     apiGroup: rbac.authorization.k8s.io
+    #     kind: Role
+    #     name: gitlab-operator-session
+    #   subjects:
+    #   - kind: ServiceAccount
+    #     namespace: $(workshop_namespace)
+    #     name: $(service_account)

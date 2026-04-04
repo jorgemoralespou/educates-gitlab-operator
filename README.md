@@ -30,30 +30,47 @@ CRDs are shipped with the chart and installed automatically.
 
 ```bash
 helm upgrade --install educates-gitlab-operator ./charts/educates-gitlab-operator \
-  --namespace gitlab-operator-system \
+  --namespace educates-gitlab-operator \
   --create-namespace
 ```
 
-### Operator-level TLS/CA Configuration
+### cert-manager Integration
 
-The operator supports cluster-wide TLS defaults so workshop users don't need to configure certificates per instance. Set these via Helm values:
+The operator uses [cert-manager](https://cert-manager.io) to manage TLS certificates automatically. cert-manager must already be installed in the cluster (it is **not** installed by this chart).
+
+For each `GitLabInstance` the operator:
+
+1. Creates a `cert-manager.io/v1` `Certificate` resource covering all GitLab hostnames (`gitlab-<name>.<domain>`, `registry-<name>.<domain>`, `minio-<name>.<domain>`).
+2. Waits for cert-manager to populate the TLS secret (`<instance-name>-tls`) before running the Helm install.
+3. Passes the secret to the GitLab chart for ingress TLS and custom CA trust, and mounts it into runner job pods so they can verify GitLab API calls.
+
+#### Default ClusterIssuer
+
+The operator default is a `ClusterIssuer` named `educateswildcard`. Override it cluster-wide at install time:
 
 ```bash
 helm upgrade --install educates-gitlab-operator ./charts/educates-gitlab-operator \
-  --namespace gitlab-operator-system \
+  --namespace educates-gitlab-operator \
   --create-namespace \
-  --set gitlab.tlsSecretName=wildcard-tls \
-  --set gitlab.caSecretName=educates-ca
+  --set gitlab.certManagerIssuerName=my-cluster-issuer
 ```
 
 | Helm Value | Env Var | Description |
 |---|---|---|
-| `gitlab.tlsSecretName` | `GITLAB_TLS_SECRET_NAME` | Default TLS secret for GitLab ingress |
-| `gitlab.caSecretName` | `GITLAB_CA_SECRET_NAME` | CA secret for operator API calls |
-| `gitlab.caSecretKey` | `GITLAB_CA_SECRET_KEY` | Key within the CA secret (default: `ca.crt`) |
+| `gitlab.certManagerIssuerName` | `GITLAB_CERT_MANAGER_ISSUER_NAME` | Default `ClusterIssuer` name (default: `educateswildcard`) |
 | `gitlab.insecureSkipTlsVerify` | `GITLAB_INSECURE_SKIP_TLS_VERIFY` | Skip TLS verification (disposable envs only) |
 
-Instance CR fields (`spec.tlsSecretRef`, `spec.caSecretRef`, `spec.insecureSkipTlsVerify`) override these defaults when set.
+#### Per-instance Override
+
+Use `spec.certManagerIssuerRef` on a `GitLabInstance` to override the issuer for that instance:
+
+```yaml
+spec:
+  domain: educates.test
+  certManagerIssuerRef:
+    name: my-other-issuer
+    kind: ClusterIssuer  # default when omitted
+```
 
 ### Install from GHCR (OCI)
 
@@ -63,7 +80,7 @@ After CI publishes the chart:
 helm install educates-gitlab-operator \
   oci://ghcr.io/jorgemoralespou/charts/educates-gitlab-operator \
   --version main \
-  --namespace gitlab-operator-system \
+  --namespace educates-gitlab-operator \
   --create-namespace
 ```
 
@@ -84,8 +101,8 @@ just build-image
 # Install via Helm (local chart)
 just install
 
-# Or install with custom values
-just install --set gitlab.tlsSecretName=my-tls --set gitlab.tlsCAName=my-ca --set image.tag=dev
+# Or install with a custom cert-manager issuer
+just install --set gitlab.certManagerIssuerName=my-cluster-issuer --set image.tag=dev
 
 # Or create a values.yaml file
 just install
@@ -109,7 +126,7 @@ just uninstall
 
 ## How It Works
 
-- On **`GitLabInstance` reconcile**: merges default + user Helm values, runs `helm upgrade --install --wait`, generates a root PAT via the GitLab toolbox pod, stores it in a Kubernetes secret.
+- On **`GitLabInstance` reconcile**: creates/updates a cert-manager `Certificate` resource and waits for the TLS secret to be ready; merges default + user Helm values, runs `helm upgrade --install --wait`, generates a root PAT via the GitLab toolbox pod, stores it in a Kubernetes secret.
 - On **`GitLabUser` reconcile**: waits for instance readiness, creates/updates the GitLab user via REST API, provisions any declared repositories.
 - On **deletion**: cascades user cleanup before uninstalling the Helm release; best-effort remote cleanup when the instance is already gone.
 
@@ -117,7 +134,7 @@ just uninstall
 
 1. Operator defaults (`operator/gitlab-values.yaml`)
 2. `spec.valuesYaml` or `spec.values` overlay
-3. Explicit field overlays: `spec.domain`, TLS/CA from CR or operator env vars
+3. Explicit field overlays: `spec.domain`, cert-manager TLS secret name, runner CA volume
 
 ### Ingress Hostnames
 

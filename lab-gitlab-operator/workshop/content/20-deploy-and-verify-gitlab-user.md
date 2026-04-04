@@ -16,7 +16,8 @@ command: |-
     name: {{< param session_namespace >}}
     namespace: {{< param session_namespace >}}
   spec:
-    instanceRef: {{< param session_namespace >}}
+    instanceRef:
+      name: {{< param session_namespace >}}
     password: WorkshopPass123!
     email: student@example.com
     name: Workshop Student
